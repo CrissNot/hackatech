@@ -1,21 +1,29 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from models import *
-from database import SessionLocal
 from sqlalchemy.orm import Session, joinedload
-from main import Gemini
+from database import SessionLocal
+from main import Gemini  # Asumimos que está bien definido
+from models import Department, Municipality, Location, LocationGHI
+import json
 
 class TextInput(BaseModel):
     text: str
 
-class Enpoints():
+
+class Enpoints:
     def __init__(self):
         self.app = FastAPI()
-        self.app.add_middleware(CORSMiddleware,  allow_origins=["*"])
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        self.gemini = Gemini()  # Inicializar una sola vez
         self.routes()
 
-    def get_db(self):
+    def get_db(self) -> Session:
         db = SessionLocal()
         try:
             yield db
@@ -23,208 +31,296 @@ class Enpoints():
             db.close()
 
     def routes(self):
-        @self.app.get('/')
+        @self.app.get("/")
         def index():
-            return {"message":"APIS FUNCIONANDO"}
+            return {"message": "APIS FUNCIONANDO"}
 
-        @self.app.get('/locations')
-        def send_message():
-            db = SessionLocal()
-            locations = db.query(Location)\
-                    .options(
-                        joinedload(Location.municipality),
-                        joinedload(Location.ghi_values)
-                    ).all()
+        # === /locations - Promedio anual calculado (sin depender de "ANUAL") ===
+        @self.app.get("/locations")
+        def send_message(year: int = Query(..., description="Año para filtrar los valores GHI.")):
+            db = next(self.get_db())
+
+            locations = (
+                db.query(Location)
+                .options(
+                    joinedload(Location.municipality),
+                    joinedload(Location.ghi_values)
+                )
+                .all()
+            )
 
             result = []
-
             for loc in locations:
-                # Buscar el GHI que corresponde al mes "ANUAL"
-                anual_ghi = next(
-                    (ghi for ghi in loc.ghi_values if ghi.month.upper() == "ANUAL"), None
-                )
+                # Obtener todos los valores mensuales del año (excluyendo "ANUAL" si existe)
+                monthly_values = [
+                    ghi.value_kwh for ghi in loc.ghi_values
+                    if ghi.year == year and ghi.month.upper() != "ANUAL"
+                ]
 
-                if anual_ghi:
-                    result.append({
-                        "municipality_name": loc.municipality.name,
-                        "latitude": loc.latitude,
-                        "longitude": loc.longitude,
-                        "valor_anual_kwh": anual_ghi.value_kwh
-                    })
-            db.close()
+                if not monthly_values:
+                    continue
+
+                avg_kwh = sum(monthly_values) / len(monthly_values)
+
+                result.append({
+                    "municipality_name": loc.municipality.name,
+                    "latitude": loc.latitude,
+                    "longitude": loc.longitude,
+                    "valor_anual_kwh": round(avg_kwh, 2),
+                    "year": year
+                })
+
+            if not result:
+                raise HTTPException(status_code=404, detail=f"No se encontraron datos para el año {year}")
+
             return result
-        
-        @self.app.get('/departments/{department_name}')
-        def get_department_stats(department_name: str):
-            db = SessionLocal()
 
-            # Traer todos los municipios del departamento con sus ubicaciones y GHI
+        # === /departments/{name} - Estadísticas por departamento ===
+        @self.app.get("/departments/{department_name}")
+        def get_department_stats(
+            department_name: str,
+            year: int = Query(..., description="Año para filtrar los valores GHI.")
+        ):
+            db = next(self.get_db())
+
             municipalities = (
                 db.query(Municipality)
                 .join(Department)
-                .filter(Department.name == department_name)  # ajusta si no guardas en mayúsculas
+                .filter(Department.name == department_name)
                 .options(
-                    joinedload(Municipality.locations).joinedload(Location.ghi_values)
+                    joinedload(Municipality.locations)
+                    .joinedload(Location.ghi_values)
                 )
                 .all()
             )
 
             if not municipalities:
-                db.close()
-                return {"error": f"No se encontraron datos para {department_name}"}
+                raise HTTPException(status_code=404, detail=f"Departamento '{department_name}' no encontrado")
 
             result = []
             for mun in municipalities:
-                # Recolectar todos los valores de GHI de ese municipio (solo meses, no anual)
-                values = [
-                    ghi for loc in mun.locations for ghi in loc.ghi_values
-                    if ghi.month != "ANUAL"
-                ]
+                # Obtener todos los valores GHI del municipio (de todas sus ubicaciones)
+                all_values = []
+                for loc in mun.locations:
+                    monthly_vals = [
+                        ghi.value_kwh for ghi in loc.ghi_values
+                        if ghi.year == year and ghi.month.upper() != "ANUAL"
+                    ]
+                    if monthly_vals:
+                        # Promediar por ubicación
+                        all_values.append(sum(monthly_vals) / len(monthly_vals))
 
-                if not values:
+                if not all_values:
                     continue
 
-                # Calcular máximo, mínimo y promedio
-                max_val = max(values, key=lambda x: x.value_kwh)
-                min_val = min(values, key=lambda x: x.value_kwh)
-                mean_val = sum(v.value_kwh for v in values) / len(values)
+                max_val = max(all_values)
+                min_val = min(all_values)
+                mean_val = sum(all_values) / len(all_values)
 
-                # Buscar el mes más cercano al promedio
-                mean_month, mean_value = min(
-                    [(ghi.month, ghi.value_kwh) for ghi in values],
-                    key=lambda x: abs(x[1] - mean_val)
-                )
+                # Encontrar el mes más cercano al promedio (usando la primera ubicación)
+                closest_ghi = None
+                closest_loc = None
+                for loc in mun.locations:
+                    for ghi in loc.ghi_values:
+                        if ghi.year == year and ghi.month.upper() != "ANUAL":
+                            if closest_ghi is None or abs(ghi.value_kwh - mean_val) < abs(closest_ghi.value_kwh - mean_val):
+                                closest_ghi = ghi
+                                closest_loc = loc
 
                 result.append({
                     "municipio": mun.name,
-                    "max": {"month": max_val.month, "value_kwh": max_val.value_kwh},
-                    "min": {"month": min_val.month, "value_kwh": min_val.value_kwh},
-                    "mean": {"month": mean_month, "value_kwh": round(mean_value, 2)}
+                    "max": {"value_kwh": round(max_val, 2)},
+                    "min": {"value_kwh": round(min_val, 2)},
+                    "mean": {
+                        "month": closest_ghi.month if closest_ghi else "N/A",
+                        "value_kwh": round(mean_val, 2)
+                    }
                 })
 
-            db.close()
+            if not result:
+                raise HTTPException(status_code=404, detail=f"No hay datos GHI para el año {year}")
+
             return {
                 "department": department_name,
+                "year": year,
                 "municipalities": result
             }
-        
-        @self.app.get('/departments')
-        def get_departments():
-            db = SessionLocal()
-            departments = db.query(Department).all()
-            db.close()
 
+        # === /departments - Lista de todos los departamentos ===
+        @self.app.get("/departments")
+        def get_departments():
+            db = next(self.get_db())
+            departments = db.query(Department).all()
             return [dept.name for dept in departments]
 
-        @self.app.get('/municipalities/{municipality_name}/range')
-        def get_municipality_range(municipality_name: str, start_month: str, end_month: str):
-            db = SessionLocal()
+        # === /municipalities/{name}/range - Valores en un rango de meses ===
+        @self.app.get("/municipalities/{municipality_name}/range")
+        def get_municipality_range(
+            municipality_name: str,
+            start_month: str,
+            end_month: str,
+            year: int = Query(..., description="Año para filtrar los valores GHI.")
+        ):
+            db = next(self.get_db())
 
-            # Buscar el municipio con sus GHI
             municipality = (
                 db.query(Municipality)
                 .filter(Municipality.name == municipality_name)
                 .options(
-                    joinedload(Municipality.locations).joinedload(Location.ghi_values)
+                    joinedload(Municipality.locations)
+                    .joinedload(Location.ghi_values)
                 )
                 .first()
             )
 
             if not municipality:
-                db.close()
-                return {"error": f"No se encontró el municipio {municipality_name}"}
+                raise HTTPException(status_code=404, detail=f"Municipio '{municipality_name}' no encontrado")
 
-            # Definimos el orden de los meses
             month_order = [
                 "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
                 "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"
             ]
 
-            # Normalizamos entrada a mayúsculas
-            start_month = start_month.upper()
-            end_month = end_month.upper()
+            start_upper = start_month.upper()
+            end_upper = end_month.upper()
 
-            if start_month not in month_order or end_month not in month_order:
-                db.close()
-                return {"error": "Mes inicial o final inválido. Usa nombres en español (ej: ENERO, FEBRERO...)"}
+            if start_upper not in month_order or end_upper not in month_order:
+                raise HTTPException(status_code=400, detail="Mes inválido. Usa: ENERO, FEBRERO...")
 
-            start_idx = month_order.index(start_month)
-            end_idx = month_order.index(end_month)
+            start_idx = month_order.index(start_upper)
+            end_idx = month_order.index(end_upper)
 
             if start_idx > end_idx:
-                db.close()
-                return {"error": "El mes inicial no puede ser mayor que el mes final"}
+                raise HTTPException(status_code=400, detail="El mes inicial no puede ser mayor que el final")
 
-            # Filtrar valores dentro del rango
-            values = [
-                {"month": ghi.month, "value_kwh": ghi.value_kwh}
-                for loc in municipality.locations
-                for ghi in loc.ghi_values
-                if ghi.month in month_order[start_idx:end_idx+1]
-            ]
+            # Filtrar valores en el rango de meses y año
+            values = []
+            for loc in municipality.locations:
+                for ghi in loc.ghi_values:
+                    if ghi.year == year and ghi.month in month_order[start_idx:end_idx + 1]:
+                        values.append({"month": ghi.month, "value_kwh": ghi.value_kwh})
 
-            db.close()
+            if not values:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No hay datos para {start_month}-{end_month} en el año {year}"
+                )
+
             return {
                 "municipality": municipality.name,
                 "range": f"{start_month} - {end_month}",
+                "year": year,
                 "values": values
             }
 
+        # === /ia_prediction/{name} - Predicción con IA (Gemini) ===
+        @self.app.get("/ia_prediction/{municipality_name}/")
+        def ia_data(
+            municipality_name: str,
+            start_month: str,
+            end_month: str,
+            year: int = Query(..., description="Año que se desea predecir (ej: 2025)")
+        ):
+            db = next(self.get_db())
 
-        @self.app.get('/ia_prediction/{municipality_name}/')
-        def ia_data(municipality_name: str, start_month: str, end_month: str):
-
-            db = SessionLocal()
-
-            # Buscar el municipio con sus GHI
+            # === 1. Buscar el municipio con TODOS sus datos ===
             municipality = (
                 db.query(Municipality)
                 .filter(Municipality.name == municipality_name)
                 .options(
-                    joinedload(Municipality.locations).joinedload(Location.ghi_values)
+                    joinedload(Municipality.locations)
+                    .joinedload(Location.ghi_values)
                 )
                 .first()
             )
 
             if not municipality:
-                db.close()
-                return {"error": f"No se encontró el municipio {municipality_name}"}
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Municipio '{municipality_name}' no encontrado"
+                )
 
-            # Definimos el orden de los meses
+            # === 2. Validar meses ===
             month_order = [
                 "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
                 "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"
             ]
 
-            # Normalizamos entrada a mayúsculas
-            start_month = start_month.upper()
-            end_month = end_month.upper()
+            start_upper = start_month.upper()
+            end_upper = end_month.upper()
 
-            if start_month not in month_order or end_month not in month_order:
-                db.close()
-                return {"error": "Mes inicial o final inválido. Usa nombres en español (ej: ENERO, FEBRERO...)"}
+            if start_upper not in month_order or end_upper not in month_order:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Mes inválido. Usa: ENERO, FEBRERO, ..., DICIEMBRE"
+                )
 
-            start_idx = month_order.index("ENERO")
-            end_idx = month_order.index("DICIEMBRE")
+            # === 3. Años históricos disponibles en la BD ===
+            historical_years = [2019, 2020, 2021, 2022, 2023]
 
-            if start_idx > end_idx:
-                db.close()
-                return {"error": "El mes inicial no puede ser mayor que el mes final"}
+            # === 4. Recolectar TODOS los valores mensuales (todos los meses, todos los años) ===
+            from collections import defaultdict
+            monthly_data = defaultdict(list)  # (mes, año) → [valores de todas las ubicaciones]
 
-            # Filtrar valores dentro del rango
-            values = [
-                {"month": ghi.month, "value_kwh": ghi.value_kwh}
-                for loc in municipality.locations
-                for ghi in loc.ghi_values
-                if ghi.month in month_order[start_idx:end_idx+1]
-            ]
+            for loc in municipality.locations:
+                for ghi in loc.ghi_values:
+                    if ghi.year in historical_years and ghi.month.upper() != "ANUAL":
+                        monthly_data[(ghi.month, ghi.year)].append(ghi.value_kwh)
+
+            # Calcular promedio por mes/año (por si hay múltiples ubicaciones)
+            all_historical_values = []
+            for (month, year_val), values in monthly_data.items():
+                avg_kwh = sum(values) / len(values)
+                all_historical_values.append({
+                    "month": month,
+                    "year": year_val,
+                    "value_kwh": round(avg_kwh, 2)
+                })
+
+            if not all_historical_values:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No hay datos históricos (2019-2024) para este municipio"
+                )
+
+            # === 5. Ordenar cronológicamente ===
+            all_historical_values.sort(key=lambda x: (x["year"], month_order.index(x["month"])))
+
+            # === 6. Enviar TODO el historial a la IA + meta de predicción ===
             data = {
                 "municipality": municipality.name,
-                "range": f"{"ENERO"} - {"DICIEMBRE"}",
-                "values": values,
-                "year":"2024"
+                "target_prediction": {
+                    "year": year,
+                    "start_month": start_upper,
+                    "end_month": end_upper,
+                    "range": f"{start_upper} - {end_upper}"
+                },
+                "historical_data": all_historical_values  # ✅ Todos los meses y años completos
             }
 
-            gen = Gemini()
-            gen.send_message(data, start_month, end_month)
-            return {"":""}
+            # === 7. Llamar a Gemini con todo el contexto ===
+            try:
+                prediction = self.gemini.send_message(anio=year, endmonth=end_month, startmonth=start_month, data=data)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error en IA: {str(e)}")
+            finally:
+                db.close()
+                print(f'"""{prediction.replace("json", " ").replace("```", " ").replace("```", " ")}"""')
+            return json.loads(f'{prediction.replace("json", " ").replace("```", " ").replace("```", " ")}')
+        
+
+        @self.app.get("/municipios/{departamento}")
+        def get_municipios(departamento: str):
+            db = next(self.get_db())
+            # Buscar el departamento (case insensitive)
+            dept = db.query(Department).filter(Department.name.ilike(departamento)).first()
+            
+            if not dept:
+                raise HTTPException(status_code=404, detail=f"El departamento '{departamento}' no existe")
+
+            municipios = db.query(Municipality).filter(Municipality.department_id == dept.id).all()
+
+            return {
+                "departamento": dept.name,
+                "municipios": [m.name for m in municipios]
+            }
