@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from models import *
 from database import SessionLocal
 from sqlalchemy.orm import Session, joinedload
+from main import Gemini
 
 class TextInput(BaseModel):
     text: str
@@ -168,3 +169,62 @@ class Enpoints():
                 "range": f"{start_month} - {end_month}",
                 "values": values
             }
+
+
+        @self.app.get('/ia_prediction/{municipality_name}/')
+        def ia_data(municipality_name: str, start_month: str, end_month: str):
+
+            db = SessionLocal()
+
+            # Buscar el municipio con sus GHI
+            municipality = (
+                db.query(Municipality)
+                .filter(Municipality.name == municipality_name)
+                .options(
+                    joinedload(Municipality.locations).joinedload(Location.ghi_values)
+                )
+                .first()
+            )
+
+            if not municipality:
+                db.close()
+                return {"error": f"No se encontró el municipio {municipality_name}"}
+
+            # Definimos el orden de los meses
+            month_order = [
+                "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"
+            ]
+
+            # Normalizamos entrada a mayúsculas
+            start_month = start_month.upper()
+            end_month = end_month.upper()
+
+            if start_month not in month_order or end_month not in month_order:
+                db.close()
+                return {"error": "Mes inicial o final inválido. Usa nombres en español (ej: ENERO, FEBRERO...)"}
+
+            start_idx = month_order.index("ENERO")
+            end_idx = month_order.index("DICIEMBRE")
+
+            if start_idx > end_idx:
+                db.close()
+                return {"error": "El mes inicial no puede ser mayor que el mes final"}
+
+            # Filtrar valores dentro del rango
+            values = [
+                {"month": ghi.month, "value_kwh": ghi.value_kwh}
+                for loc in municipality.locations
+                for ghi in loc.ghi_values
+                if ghi.month in month_order[start_idx:end_idx+1]
+            ]
+            data = {
+                "municipality": municipality.name,
+                "range": f"{"ENERO"} - {"DICIEMBRE"}",
+                "values": values,
+                "year":"2024"
+            }
+
+            gen = Gemini()
+            gen.send_message(data, start_month, end_month)
+            return {"":""}
