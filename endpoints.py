@@ -106,3 +106,11 @@ class Enpoints():
                 "department": department_name,
                 "municipalities": result
             }
+        
+        @self.app.get('/departments')
+        def get_departments():
+            db = SessionLocal()
+            departments = db.query(Department).all()
+            db.close()
+
+            return [dept.name for dept in departments]
