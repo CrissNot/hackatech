@@ -42,7 +42,7 @@ La respuesta debe consistir exclusivamente en un JSON válido con los valores de
 
 Nuevamente recuerda y ten presente que no debes devolverme el mismo json que te estamos entregando, sino, que tienes que realizar la respectiva predicción real aplicando el metodo Hunt winters
 
-Te recuerdo que no puedes responder con mas que con el json
+Te recuerdo que no puedes responder con mas que con el json, no respondas con texto adicional solo con json porfavor
 """
 
         response = self.model.generate_content(prompt)

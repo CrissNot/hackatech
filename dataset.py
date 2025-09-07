@@ -192,7 +192,7 @@ def process_file(file_path):
                     if not exists:
                         # Convertir kWh/m²/día → MJ/m²/día (1 kWh ≈ 3.6 MJ)
                         value_mj = round(value_kwh, 2) 
-                        value_kwh_rounded = round(value_kwh / 3.6, 2)
+                        value_kwh_rounded = value_kwh 
 
                         ghi_entry = LocationGHI(
                             location_id=location.id,
